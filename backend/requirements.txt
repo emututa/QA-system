@@ -1,0 +1,14 @@
+Django>=5.2,<6.0
+djangorestframework>=3.16,<4.0
+django-filter>=25.1
+psycopg[binary]>=3.2
+celery>=5.5
+redis>=6.2
+django-cors-headers>=4.7
+dj-database-url>=3.0
+djangorestframework-simplejwt>=5.5
+prometheus-client>=0.22
+httpx>=0.28
+pytest>=8.4
+pytest-django>=4.11
+python-json-logger>=3.3

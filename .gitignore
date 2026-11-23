@@ -1,0 +1,77 @@
+# Environment files and local configuration
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Secrets and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.cer
+*.p8
+secrets/
+**/secrets/
+credentials/
+**/credentials/
+
+# Cloud and deployment credentials
+.aws/
+**/.aws/
+.gcloud/
+**/.gcloud/
+.azure/
+**/.azure/
+.kube/config
+*.tfvars
+*.tfvars.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite3
+*.db
+backend/db.sqlite3
+backend/staticfiles/
+
+# Node and frontend
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+dist/
+coverage/
+.npmrc
+.pnpm-store/
+
+# Docker and runtime data
+postgres_data/
+volumes/
+*.log
+logs/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archives and local artifacts
+*.zip
+*.tar
+*.tar.gz
+*.bak
