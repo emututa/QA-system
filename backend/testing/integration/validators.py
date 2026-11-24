@@ -20,7 +20,10 @@ def validate_external_url(value: str) -> str:
     if hostname in BLOCKED_HOSTS:
         raise ValidationError("Loopback and metadata addresses are blocked")
     try:
-        addresses = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        addresses = socket.getaddrinfo(
+            hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+        )
     except socket.gaierror as exc:
         raise ValidationError("Hostname could not be resolved") from exc
     for _family, _type, _proto, _canonical, sockaddr in addresses:

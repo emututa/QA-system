@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import *
-from .services import validate_external_url
+from integrations.github.repository import parse_github_repository
+from testing.integration.validators import validate_external_url
 
 
 class OrganizationSerializer(serializers.ModelSerializer):
@@ -31,6 +32,41 @@ class ApplicationSerializer(serializers.ModelSerializer):
                 except DjangoValidationError as exc:
                     raise serializers.ValidationError({field: exc.messages})
         return attrs
+
+
+class ApplicationRegistrationSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=200)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    github_repository = serializers.CharField(max_length=1000)
+    default_branch = serializers.CharField(max_length=200, required=False, default="main")
+    staging_url = serializers.URLField(max_length=1000)
+    authorized_testing = serializers.BooleanField(write_only=True)
+    technology_stack = serializers.ListField(
+        child=serializers.CharField(max_length=100),
+        required=False,
+        default=list,
+    )
+
+    def validate_github_repository(self, value):
+        try:
+            parse_github_repository(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
+        return value.rstrip("/").removesuffix(".git")
+
+    def validate_staging_url(self, value):
+        try:
+            validate_external_url(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
+        return value
+
+    def validate_authorized_testing(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "Confirm that you are authorized to run read-only checks against this staging application."
+            )
+        return value
 
 
 class EnvironmentSerializer(serializers.ModelSerializer):

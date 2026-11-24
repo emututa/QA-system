@@ -13,7 +13,7 @@ INSTALLED_APPS = [
     "django.contrib.auth", "django.contrib.contenttypes",
     "django.contrib.sessions", "django.contrib.staticfiles",
     "corsheaders", "django_filters", "rest_framework", "rest_framework_simplejwt",
-    "core",
+    "applications.apps.ApplicationsConfig",
 ]
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware", "django.middleware.security.SecurityMiddleware",
@@ -37,8 +37,8 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS", "http://localhost:3000").split(",")
+CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3003").split(",")
+CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS", "http://localhost:3003").split(",")
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": ("rest_framework_simplejwt.authentication.JWTAuthentication",),

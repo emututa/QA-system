@@ -29,8 +29,13 @@ services:
     environment:
       DATABASE_URL: postgres://zimworx:zimworx@postgres:5432/zimworx_qa
       REDIS_URL: redis://redis:6379/0
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
       DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,backend
-      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      CORS_ALLOWED_ORIGINS: http://localhost:3003
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -41,15 +46,21 @@ services:
     environment:
       DATABASE_URL: postgres://zimworx:zimworx@postgres:5432/zimworx_qa
       REDIS_URL: redis://redis:6379/0
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
 
   frontend:
-    build: ./frontend
-    ports: ["3003:3000"]
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:8000
+    ports: ["3003:80"]
     depends_on: [backend]
 
   prometheus:

@@ -4,6 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN python manage.py collectstatic --noinput || true
+RUN useradd --system --uid 10001 --create-home app && chown -R app:app /app
+USER app
 EXPOSE 8000
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]

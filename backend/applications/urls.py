@@ -15,4 +15,10 @@ router.register("quality-gates", QualityGateResultViewSet, basename="quality-gat
 router.register("defects", DefectViewSet, basename="defect")
 router.register("dashboard", DashboardViewSet, basename="dashboard")
 
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("applications/register/", ApplicationRegistrationView.as_view(), name="application-register"),
+    path("organizations/bootstrap/", OrganizationBootstrapView.as_view(), name="organization-bootstrap"),
+    path("auth/me/", CurrentUserView.as_view(), name="current-user"),
+    path("monitoring/", MonitoringView.as_view(), name="monitoring"),
+    path("", include(router.urls)),
+]
