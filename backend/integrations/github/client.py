@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote
 
 import httpx
 
@@ -22,7 +23,8 @@ class GitHubClient:
         *,
         params: dict[str, str] | None = None,
     ) -> httpx.Response:
-        url = f"https://api.github.com/repos/{owner}/{repository}/{resource}".rstrip("/")
+        encoded_resource = quote(resource.strip("/"), safe="/")
+        url = f"https://api.github.com/repos/{owner}/{repository}/{encoded_resource}".rstrip("/")
         with httpx.Client(
             timeout=10,
             follow_redirects=False,

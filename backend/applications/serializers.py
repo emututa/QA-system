@@ -64,7 +64,7 @@ class ApplicationRegistrationSerializer(serializers.Serializer):
     def validate_authorized_testing(self, value):
         if not value:
             raise serializers.ValidationError(
-                "Confirm that you are authorized to run read-only checks against this staging application."
+                "Confirm authorization to read repository files and run read-only checks against this staging application."
             )
         return value
 

@@ -46,6 +46,7 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": ("django_filters.rest_framework.DjangoFilterBackend", "rest_framework.filters.SearchFilter", "rest_framework.filters.OrderingFilter"),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 25,
+    "DEFAULT_THROTTLE_RATES": {"ai_assistant": "10/hour"},
 }
 SIMPLE_JWT = {"ACCESS_TOKEN_LIFETIME": timedelta(minutes=30), "REFRESH_TOKEN_LIFETIME": timedelta(days=1)}
 CELERY_BROKER_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -53,3 +54,4 @@ CELERY_RESULT_BACKEND = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 1800
 CELERY_TASK_SOFT_TIME_LIMIT = 1500
+RUNNER_URL = os.getenv("RUNNER_URL", "").strip()

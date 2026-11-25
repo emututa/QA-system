@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+import httpx
+from django.core.exceptions import ValidationError
 from django.db.models import Count, Q
 from django.db.models.functions import TruncDate
 from django.db import transaction
@@ -14,7 +16,17 @@ from rest_framework.views import APIView
 from .models import *
 from .permissions import HasQAProfile, IsApplicationOwnerOrQA
 from .serializers import *
-from .tasks import execute_test_run
+from .tasks import execute_approved_candidate, execute_test_run
+from integrations.github.repository import GitHubAPIError, retrieve_repository_file
+from ai_engine.failure_analysis import analyze_failure
+from ai_engine.provider import (
+    AIConfigurationError,
+    AIProviderError,
+    request_json,
+    validate_ai_configuration,
+)
+from ai_engine.test_generator import generate_test_file, suggest_tests
+from ai_engine.throttles import AIAssistantThrottle
 
 
 class OrganizationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -35,6 +47,322 @@ class ApplicationViewSet(viewsets.ReadOnlyModelViewSet):
         if not profile:
             return Application.objects.none()
         return Application.objects.filter(team__organization=profile.organization)
+
+    @action(detail=True, methods=("get",), url_path="repository-file")
+    def repository_file(self, request, pk=None):
+        application = self.get_object()
+        if "github_source_read" not in application.approved_test_scope:
+            return Response(
+                {"detail": "Source retrieval is not authorized for this application. Re-register with explicit authorization."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        file_path = request.query_params.get("path", "")
+        try:
+            result = retrieve_repository_file(
+                application.github_repository,
+                application.default_branch,
+                file_path,
+            )
+        except ValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        except GitHubAPIError as exc:
+            response_status = exc.status_code if exc.status_code in {401, 403, 404, 429} else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except httpx.RequestError:
+            return Response(
+                {"detail": "GitHub could not be reached while retrieving the repository file."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="ai/test-suggestions",
+        throttle_classes=(AIAssistantThrottle,),
+    )
+    def ai_test_suggestions(self, request, pk=None):
+        application = self.get_object()
+        if "github_source_read" not in application.approved_test_scope:
+            return Response(
+                {"detail": "AI suggestions require explicit authorization to read repository source."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not isinstance(request.data, dict):
+            return Response({"detail": "A JSON object containing the source path is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_ai_configuration()
+        except AIConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        file_path = request.data.get("path", "")
+        if not isinstance(file_path, str) or not file_path:
+            return Response({"detail": "A repository-relative source file path is required."}, status=status.HTTP_400_BAD_REQUEST)
+        filename = file_path.lower().rsplit("/", 1)[-1]
+        if filename.startswith(".env") or filename in {
+            "credentials.json",
+            "secrets.json",
+            "service-account.json",
+        }:
+            return Response({"detail": "AI source analysis is disabled for credential files."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            source = retrieve_repository_file(
+                application.github_repository,
+                application.default_branch,
+                file_path,
+            )
+        except ValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        except GitHubAPIError as exc:
+            response_status = exc.status_code if exc.status_code in {401, 403, 404, 429} else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except httpx.RequestError:
+            return Response(
+                {"detail": "GitHub could not be reached while retrieving the source file."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        try:
+            result = suggest_tests(source["path"], source["content"])
+        except AIConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except AIProviderError as exc:
+            response_status = 429 if exc.status_code == 429 else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        result["source_file"] = source["path"]
+        result["source_file_size_bytes"] = source["size_bytes"]
+        result["source_characters_considered"] = min(len(source["content"]), 20000)
+        return Response(result)
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="ai/provider-check",
+        throttle_classes=(AIAssistantThrottle,),
+    )
+    def ai_provider_check(self, request, pk=None):
+        self.get_object()
+        try:
+            _, model = validate_ai_configuration()
+            result = request_json(
+                instructions="Return valid JSON only.",
+                prompt='Confirm model access by returning exactly {"ok": true}.',
+            )
+        except AIConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except AIProviderError as exc:
+            response_status = 429 if exc.status_code == 429 else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        if result.get("ok") is not True:
+            return Response(
+                {"detail": "OpenAI responded, but the model did not return the expected connection-check result."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response({"connected": True, "provider": "openai", "model": model})
+
+    @action(
+        detail=True,
+        methods=("get",),
+        url_path="ai/candidates",
+    )
+    def ai_candidates(self, request, pk=None):
+        application = self.get_object()
+        candidates = TestCase.objects.filter(
+            suite__application=application,
+            definition__kind="ai_generated",
+        ).order_by("-created_at")[:20]
+        return Response([
+            {
+                "id": str(candidate.id),
+                "title": candidate.name,
+                "rationale": candidate.definition.get("rationale", ""),
+                "source_file": candidate.definition.get("source_file", ""),
+                "source_sha": candidate.definition.get("source_sha", ""),
+                "framework": candidate.definition.get("framework", ""),
+                "test_code": candidate.definition.get("test_code", ""),
+                "approved": candidate.approved,
+                "status": candidate.definition.get("status", "pending_review"),
+            }
+            for candidate in candidates
+        ])
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="ai/generate-test",
+        throttle_classes=(AIAssistantThrottle,),
+    )
+    def ai_generate_test(self, request, pk=None):
+        application = self.get_object()
+        if "github_source_read" not in application.approved_test_scope:
+            return Response(
+                {"detail": "AI test generation requires explicit authorization to read repository source."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        file_path = request.data.get("path", "") if isinstance(request.data, dict) else ""
+        if not isinstance(file_path, str) or not file_path:
+            return Response({"detail": "A repository-relative Python source path is required."}, status=status.HTTP_400_BAD_REQUEST)
+        filename = file_path.lower().rsplit("/", 1)[-1]
+        if filename.startswith(".env") or filename in {
+            "credentials.json",
+            "secrets.json",
+            "service-account.json",
+        }:
+            return Response({"detail": "AI source analysis is disabled for credential files."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_ai_configuration()
+            source = retrieve_repository_file(
+                application.github_repository,
+                application.default_branch,
+                file_path,
+            )
+            if not source.get("sha"):
+                return Response(
+                    {"detail": "GitHub did not provide a source revision to pin this test candidate to."},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            result = generate_test_file(source["path"], source["content"])
+        except ValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        except GitHubAPIError as exc:
+            response_status = exc.status_code if exc.status_code in {401, 403, 404, 429} else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except httpx.RequestError:
+            return Response(
+                {"detail": "GitHub could not be reached while retrieving the source file."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except AIConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except AIProviderError as exc:
+            response_status = 429 if exc.status_code == 429 else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        suite, _ = TestSuite.objects.get_or_create(
+            application=application,
+            name="AI-generated candidate tests",
+            defaults={"description": "Untrusted AI-generated pytest candidates requiring explicit human approval."},
+        )
+        definition = {
+            **result,
+            "kind": "ai_generated",
+            "source_file": source["path"],
+            "source_sha": source["sha"],
+            "source_branch": application.default_branch,
+            "status": "pending_review",
+        }
+        candidate = TestCase.objects.create(
+            suite=suite,
+            name=result["title"],
+            category="unit",
+            definition=definition,
+            approved=False,
+        )
+        return Response(
+            {
+                "id": str(candidate.id),
+                "title": candidate.name,
+                "rationale": definition["rationale"],
+                "source_file": source["path"],
+                "source_sha": source["sha"],
+                "framework": definition["framework"],
+                "test_code": definition["test_code"],
+                "approved": False,
+                "status": "pending_review",
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path=r"ai/candidates/(?P<candidate_id>[^/.]+)/approve",
+    )
+    def approve_ai_candidate(self, request, pk=None, candidate_id=None):
+        application = self.get_object()
+        candidate = TestCase.objects.filter(
+            pk=candidate_id,
+            suite__application=application,
+            definition__kind="ai_generated",
+        ).first()
+        if candidate is None:
+            return Response({"detail": "AI test candidate not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not candidate.approved:
+            candidate.approved = True
+            candidate.definition["status"] = "approved"
+            candidate.definition["approved_by"] = request.user.get_username()
+            candidate.definition["approved_at"] = timezone.now().isoformat()
+            candidate.save(update_fields=("approved", "definition", "updated_at"))
+        return Response({"id": str(candidate.id), "approved": True, "status": "approved"})
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path=r"ai/candidates/(?P<candidate_id>[^/.]+)/run",
+    )
+    def run_ai_candidate(self, request, pk=None, candidate_id=None):
+        application = self.get_object()
+        candidate = TestCase.objects.filter(
+            pk=candidate_id,
+            suite__application=application,
+            definition__kind="ai_generated",
+        ).first()
+        if candidate is None:
+            return Response({"detail": "AI test candidate not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not candidate.approved:
+            return Response(
+                {"detail": "Review and explicitly approve this candidate before execution."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        environment = application.environments.filter(name="Staging").first()
+        if environment is None:
+            return Response({"detail": "Register a staging environment before running tests."}, status=status.HTTP_400_BAD_REQUEST)
+        run = TestRun.objects.create(
+            application=application,
+            environment=environment,
+            suite=candidate.suite,
+            initiated_by=request.user,
+            status=TestRun.Status.QUEUED,
+        )
+        transaction.on_commit(
+            lambda: execute_approved_candidate.delay(str(run.id), str(candidate.id))
+        )
+        return Response({"id": str(run.id), "status": run.status}, status=status.HTTP_202_ACCEPTED)
+
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="ai/failure-analysis",
+        throttle_classes=(AIAssistantThrottle,),
+    )
+    def ai_failure_analysis(self, request, pk=None):
+        application = self.get_object()
+        if not isinstance(request.data, dict):
+            return Response({"detail": "A JSON object containing failure details is required."}, status=status.HTTP_400_BAD_REQUEST)
+        test_name = request.data.get("test_name", "")
+        error_message = request.data.get("error_message", "")
+        stack_trace = request.data.get("stack_trace", "")
+        if not isinstance(test_name, str) or not test_name.strip() or len(test_name) > 500:
+            return Response({"detail": "Test name is required and must be at most 500 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(error_message, str) or not error_message.strip() or len(error_message) > 8000:
+            return Response({"detail": "Failure message is required and must be at most 8,000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(stack_trace, str) or len(stack_trace) > 12000:
+            return Response({"detail": "Stack trace must be at most 12,000 characters."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_ai_configuration()
+            result = analyze_failure(test_name.strip(), error_message, stack_trace)
+        except AIConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except AIProviderError as exc:
+            response_status = 429 if exc.status_code == 429 else 502
+            return Response({"detail": str(exc)}, status=response_status)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        result["review_required"] = True
+        return Response(result)
 
     @action(detail=True, methods=("post",), url_path="run-assessment")
     def run_assessment(self, request, pk=None):
@@ -142,8 +470,14 @@ class ApplicationRegistrationView(APIView):
                 **application_data,
                 owner=request.user,
                 team=profile.team,
-                testing_permissions="User confirmed authorization for a read-only GitHub and staging assessment.",
-                approved_test_scope=["github_read_metadata", "staging_http_get"],
+                testing_permissions=(
+                    "User confirmed read-only GitHub source-file access and staging HTTP GET assessment."
+                ),
+                approved_test_scope=[
+                    "github_read_metadata",
+                    "github_source_read",
+                    "staging_http_get",
+                ],
             )
             Environment.objects.create(
                 application=application,
@@ -238,9 +572,19 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     serializer_class = TestSuiteSerializer
 
 
-class TestCaseViewSet(viewsets.ModelViewSet):
-    queryset = TestCase.objects.select_related("suite")
+class TestCaseViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TestCaseSerializer
+    permission_classes = (HasQAProfile,)
+
+    def get_queryset(self):
+        cases = TestCase.objects.select_related("suite", "suite__application")
+        user = self.request.user
+        if user.is_superuser:
+            return cases
+        profile = getattr(user, "qa_profile", None)
+        if not profile:
+            return cases.none()
+        return cases.filter(suite__application__team__organization=profile.organization)
 
 
 class TestRunViewSet(viewsets.ReadOnlyModelViewSet):

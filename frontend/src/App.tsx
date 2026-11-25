@@ -46,6 +46,33 @@ type AssessmentRun = {
   suite: string;
   executions: Execution[];
 };
+type AISuggestionResult = {
+  kind: "suggestions";
+  suggestions: Array<{ title: string; rationale: string; test_outline: string }>;
+  source_file: string;
+  review_required: true;
+  code_executed: false;
+};
+type AICandidate = {
+  id: string;
+  title: string;
+  rationale: string;
+  source_file: string;
+  source_sha: string;
+  framework: string;
+  test_code: string;
+  approved: boolean;
+  status: string;
+};
+type AIFailureResult = {
+  kind: "analysis";
+  summary: string;
+  likely_causes: string[];
+  next_steps: string[];
+  confidence: "low" | "medium" | "high";
+  review_required: true;
+};
+type AIResult = AISuggestionResult | AIFailureResult;
 type ApiError = Error & { data?: Record<string, unknown> };
 type Page = "overview" | "applications" | "register";
 
@@ -61,6 +88,126 @@ async function apiRequest<T>(path: string, token: string, init: RequestInit = {}
     throw error;
   }
   return body as T;
+}
+
+async function checkAIProvider(application: ApplicationItem) {
+  const resultKey = `provider:${application.id}`;
+  setAiBusyKey(resultKey);
+  setError("");
+  setAiProviderStatus((current) => ({ ...current, [application.id]: "" }));
+  try {
+    const result = await apiRequest<{ connected: boolean; provider: string; model: string }>(
+      `/api/applications/${application.id}/ai/provider-check/`,
+      token,
+      { method: "POST" },
+    );
+    setAiProviderStatus((current) => ({
+      ...current,
+      [application.id]: `Connected · ${result.provider} · ${result.model}`,
+    }));
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : "OpenAI connection check failed.";
+    setAiProviderStatus((current) => ({ ...current, [application.id]: message }));
+    setError(message);
+  } finally {
+    setAiBusyKey("");
+  }
+}
+
+async function generateExecutableTest(application: ApplicationItem) {
+  const path = aiSourcePaths[application.id]?.trim();
+  if (!path) {
+    setError("Enter a repository-relative Python source file path to generate an executable test.");
+    return;
+  }
+  const busyKey = `generate:${application.id}`;
+  setAiBusyKey(busyKey);
+  setError("");
+  try {
+    const candidate = await apiRequest<AICandidate>(
+      `/api/applications/${application.id}/ai/generate-test/`,
+      token,
+      { method: "POST", body: JSON.stringify({ path }) },
+    );
+    setAiCandidates((current) => ({
+      ...current,
+      [application.id]: [candidate, ...(current[application.id] ?? [])].slice(0, 20),
+    }));
+  } catch (cause) {
+    setError(cause instanceof Error ? cause.message : "Could not generate an executable test candidate.");
+  } finally {
+    setAiBusyKey("");
+  }
+}
+
+async function approveAICandidate(application: ApplicationItem, candidate: AICandidate) {
+  const busyKey = `approve:${application.id}:${candidate.id}`;
+  setAiBusyKey(busyKey);
+  setError("");
+  try {
+    await apiRequest(
+      `/api/applications/${application.id}/ai/candidates/${candidate.id}/approve/`,
+      token,
+      { method: "POST" },
+    );
+    setAiCandidates((current) => ({
+      ...current,
+      [application.id]: (current[application.id] ?? []).map((item) =>
+        item.id === candidate.id ? { ...item, approved: true, status: "approved" } : item,
+      ),
+    }));
+  } catch (cause) {
+    setError(cause instanceof Error ? cause.message : "Could not approve this test candidate.");
+  } finally {
+    setAiBusyKey("");
+  }
+}
+
+async function runAICandidate(application: ApplicationItem, candidate: AICandidate) {
+  const busyKey = `run:${application.id}:${candidate.id}`;
+  setAiBusyKey(busyKey);
+  setRunningApplication(application.id);
+  setError("");
+  setAiCandidates((current) => ({
+    ...current,
+    [application.id]: (current[application.id] ?? []).map((item) =>
+      item.id === candidate.id ? { ...item, status: "queued" } : item,
+    ),
+  }));
+  try {
+    const queued = await apiRequest<{ id: string; status: string }>(
+      `/api/applications/${application.id}/ai/candidates/${candidate.id}/run/`,
+      token,
+      { method: "POST" },
+    );
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await wait(1500);
+      const runs = await apiRequest<AssessmentRun[]>(
+        `/api/applications/${application.id}/assessment-runs/`,
+        token,
+      );
+      const latest = runs.find((run) => run.id === queued.id);
+      if (latest) {
+        setRunsByApplication((current) => ({ ...current, [application.id]: latest }));
+        const execution = latest.executions.find((item) => item.test_name === candidate.title);
+        if (execution) {
+          setAiCandidates((current) => ({
+            ...current,
+            [application.id]: (current[application.id] ?? []).map((item) =>
+              item.id === candidate.id ? { ...item, status: execution.status } : item,
+            ),
+          }));
+        }
+        if (!["queued", "running"].includes(latest.status)) break;
+      }
+    }
+    await refreshData(token);
+  } catch (cause) {
+    setError(cause instanceof Error ? cause.message : "Could not run the approved test candidate.");
+  } finally {
+    setAiBusyKey("");
+    setRunningApplication("");
+  }
 }
 
 function routeFromPath(path: string): Page {
@@ -84,6 +231,11 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [runningApplication, setRunningApplication] = useState("");
   const [runsByApplication, setRunsByApplication] = useState<Record<string, AssessmentRun | undefined>>({});
+  const [aiSourcePaths, setAiSourcePaths] = useState<Record<string, string>>({});
+  const [aiResults, setAiResults] = useState<Record<string, AIResult | undefined>>({});
+  const [aiBusyKey, setAiBusyKey] = useState("");
+  const [aiCandidates, setAiCandidates] = useState<Record<string, AICandidate[]>>({});
+  const [aiProviderStatus, setAiProviderStatus] = useState<Record<string, string>>({});
   const [registrationMessage, setRegistrationMessage] = useState("");
   const [organization, setOrganization] = useState("");
   const [team, setTeam] = useState("");
@@ -115,9 +267,15 @@ export default function App() {
         apiRequest<Dashboard>("/api/dashboard/", accessToken),
         apiRequest<{ results: ApplicationItem[] } | ApplicationItem[]>("/api/applications/", accessToken),
       ]);
+      const applicationItems = Array.isArray(applicationData) ? applicationData : applicationData.results;
       setProfile(currentProfile);
       setDashboard(dashboardData);
-      setApplications(Array.isArray(applicationData) ? applicationData : applicationData.results);
+      setApplications(applicationItems);
+      const candidateLists = await Promise.all(applicationItems.map(async (application) => [
+        application.id,
+        await apiRequest<AICandidate[]>(`/api/applications/${application.id}/ai/candidates/`, accessToken),
+      ] as const));
+      setAiCandidates(Object.fromEntries(candidateLists));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load QA platform data.");
     } finally {
@@ -226,6 +384,53 @@ export default function App() {
     }
   }
 
+  async function requestTestSuggestions(application: ApplicationItem) {
+    const path = aiSourcePaths[application.id]?.trim();
+    if (!path) {
+      setError("Enter a repository-relative source file path for AI test suggestions.");
+      return;
+    }
+    const resultKey = `suggestions:${application.id}`;
+    setAiBusyKey(resultKey);
+    setError("");
+    try {
+      const result = await apiRequest<Omit<AISuggestionResult, "kind">>(
+        `/api/applications/${application.id}/ai/test-suggestions/`,
+        token,
+        { method: "POST", body: JSON.stringify({ path }) },
+      );
+      setAiResults((current) => ({ ...current, [resultKey]: { ...result, kind: "suggestions" } }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not generate test suggestions.");
+    } finally {
+      setAiBusyKey("");
+    }
+  }
+
+  async function requestFailureAnalysis(application: ApplicationItem, execution: Execution) {
+    const resultKey = `failure:${application.id}:${execution.id}`;
+    setAiBusyKey(resultKey);
+    setError("");
+    try {
+      const result = await apiRequest<Omit<AIFailureResult, "kind">>(
+        `/api/applications/${application.id}/ai/failure-analysis/`,
+        token,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            test_name: execution.test_name,
+            error_message: execution.error_message || JSON.stringify(execution.actual),
+          }),
+        },
+      );
+      setAiResults((current) => ({ ...current, [resultKey]: { ...result, kind: "analysis" } }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not analyze the failure.");
+    } finally {
+      setAiBusyKey("");
+    }
+  }
+
   const pageTitle = route === "register" ? "Register Application" : route === "applications" ? "Applications" : "Overview";
   const navigation = [
     { label: "Overview", path: "/", icon: LayoutDashboard, page: "overview" as const },
@@ -295,8 +500,8 @@ export default function App() {
             <label className="form-wide">Technology stack (optional, comma-separated)<input value={form.technology_stack} onChange={(event) => setForm({ ...form, technology_stack: event.target.value })} placeholder="Detected during repository assessment"/></label>
             <label className="form-wide">Description (optional)<textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} rows={3} placeholder="What does this application do?"/></label>
           </div>
-          <div className="scope-note"><ShieldCheck size={17}/><span>The initial QA preflight checks GitHub access and test setup, then sends a read-only GET request to your registered staging URL. It does not modify the repository or execute its code.</span></div>
-          <label className="authorization-check"><input type="checkbox" checked={authorizedTesting} onChange={(event) => setAuthorizedTesting(event.target.checked)} required/><span>I am authorized to run these read-only checks against this repository and staging environment.</span></label>
+          <div className="scope-note"><ShieldCheck size={17}/><span>Registration checks are read-only and do not execute code. A generated unit-test candidate can run only after separate human approval in the application workspace.</span></div>
+          <label className="authorization-check"><input type="checkbox" checked={authorizedTesting} onChange={(event) => setAuthorizedTesting(event.target.checked)} required/><span>I am authorized to read files from this repository and run read-only checks against this repository and staging environment.</span></label>
           {registrationMessage && <p className="success-message" role="status">{registrationMessage}</p>}
           <div className="form-actions"><button type="button" className="subtle-button" onClick={() => navigate("/applications")}>Cancel</button><button type="submit" className="primary-button" disabled={loading || Boolean(profile?.needs_setup && !profile.is_admin)}>{loading ? "Registering…" : "Register application"}</button></div>
         </form>
@@ -306,16 +511,78 @@ export default function App() {
           : <div className="application-list">{applications.map((application) => {
             const latestRun = runsByApplication[application.id];
             const isRunning = runningApplication === application.id;
+            const suggestionResult = aiResults[`suggestions:${application.id}`];
             return <article className="panel application-card" key={application.id}>
               <div className="application-heading"><div><h3>{application.name}</h3><p>{application.description || "No description provided."}</p></div><span className="status">{application.status}</span></div>
               <div className="application-info"><span><strong>Repository</strong><a href={application.github_repository} target="_blank" rel="noreferrer">{application.github_repository}</a></span><span><strong>Branch</strong>{application.default_branch}</span><span><strong>Staging</strong><a href={application.staging_url} target="_blank" rel="noreferrer">{application.staging_url}</a></span></div>
               <div className="assessment-actions"><button className="primary-button" disabled={isRunning} onClick={() => void runAssessment(application)}><TestTube2 size={16}/>{isRunning ? "Checking repository and staging…" : "Run QA preflight"}</button>{latestRun && <span className={`assessment-status ${latestRun.status}`}>Latest: {latestRun.status}</span>}</div>
+              <section className="ai-tools" aria-label="AI-assisted QA">
+                <h4>AI QA assistant</h4>
+                <p>OpenAI is contacted only when requested. Generated pytest files require your review and explicit approval before isolated execution.</p>
+                <div className="ai-provider-action">
+                  <button
+                    className="text-button"
+                    disabled={Boolean(aiBusyKey)}
+                    onClick={() => void checkAIProvider(application)}
+                  >{aiBusyKey === `provider:${application.id}` ? "Checking OpenAI…" : "Test OpenAI connection"}</button>
+                  {aiProviderStatus[application.id] && <small role="status">{aiProviderStatus[application.id]}</small>}
+                </div>
+                <div className="ai-source-action">
+                  <label>Repository source file
+                    <input
+                      value={aiSourcePaths[application.id] ?? ""}
+                      onChange={(event) => setAiSourcePaths((current) => ({ ...current, [application.id]: event.target.value }))}
+                      placeholder="src/example.py"
+                    />
+                  </label>
+                  <button
+                    className="subtle-button"
+                    disabled={Boolean(aiBusyKey)}
+                    onClick={() => void requestTestSuggestions(application)}
+                  >{aiBusyKey === `suggestions:${application.id}` ? "Generating…" : "Suggest tests"}</button>
+                  <button
+                    className="subtle-button"
+                    disabled={Boolean(aiBusyKey)}
+                    onClick={() => void generateExecutableTest(application)}
+                  >{aiBusyKey === `generate:${application.id}` ? "Generating test file…" : "Generate pytest file"}</button>
+                </div>
+                {suggestionResult?.kind === "suggestions" && <div className="ai-result">
+                  <strong>Suggested tests for {suggestionResult.source_file}</strong>
+                  {suggestionResult.suggestions.map((suggestion, index) => <article key={`${suggestion.title}-${index}`}>
+                    <b>{suggestion.title}</b><p>{suggestion.rationale}</p><small>{suggestion.test_outline}</small>
+                  </article>)}
+                </div>}
+              </section>
               {latestRun && <div className="assessment-results"><p>{latestRun.suite} · {new Date(latestRun.created_at).toLocaleString()}</p>
-                {latestRun.executions.map((execution) => <div key={execution.id} className="execution-row"><span className={`result-dot ${execution.status}`}/><strong>{execution.test_name}</strong><span>{execution.status}</span><small>{execution.error_message || Object.entries(execution.actual).map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : String(value ?? "—")}`).join(" · ")}</small></div>)}
+                {latestRun.executions.map((execution) => {
+                  const failureKey = `failure:${application.id}:${execution.id}`;
+                  const failureResult = aiResults[failureKey];
+                  return <div key={execution.id} className="execution-row"><span className={`result-dot ${execution.status}`}/><strong>{execution.test_name}</strong><span>{execution.status}</span><small>{execution.error_message || Object.entries(execution.actual).map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : String(value ?? "—")}`).join(" · ")}</small>
+                    {execution.status === "failed" && <button className="text-button" disabled={Boolean(aiBusyKey)} onClick={() => void requestFailureAnalysis(application, execution)}>{aiBusyKey === failureKey ? "Analyzing…" : "Analyze with AI"}</button>}
+                    {failureResult?.kind === "analysis" && <div className="ai-result"><strong>AI analysis · {failureResult.confidence} confidence</strong><p>{failureResult.summary}</p><b>Likely causes</b><ul>{failureResult.likely_causes.map((cause, index) => <li key={index}>{cause}</li>)}</ul><b>Next steps</b><ul>{failureResult.next_steps.map((step, index) => <li key={index}>{step}</li>)}</ul></div>}
+                  </div>;
+                })}
               </div>}
+              {(aiCandidates[application.id] ?? []).map((candidate) => <article className="ai-candidate" key={candidate.id}>
+                <div className="ai-candidate-heading">
+                  <strong>{candidate.title}</strong>
+                  <span className={`assessment-status ${candidate.status}`}>{candidate.status.replaceAll("_", " ")}</span>
+                </div>
+                <p>{candidate.rationale}</p>
+                <small>{candidate.source_file} · {candidate.framework} · source {candidate.source_sha.slice(0, 10)}</small>
+                <details><summary>Review generated test code</summary><pre>{candidate.test_code}</pre></details>
+                <div className="assessment-actions">
+                  {!candidate.approved
+                    ? <button className="subtle-button" disabled={Boolean(aiBusyKey)} onClick={() => void approveAICandidate(application, candidate)}>Approve for execution</button>
+                    : <button className="primary-button" disabled={Boolean(aiBusyKey) || isRunning} onClick={() => void runAICandidate(application, candidate)}>
+                      {aiBusyKey === `run:${application.id}:${candidate.id}` ? "Running isolated test…" : "Run approved test"}
+                    </button>}
+                  {!candidate.approved && <span className="scope-disclaimer">Not executable until you approve it.</span>}
+                </div>
+              </article>)}
             </article>;
           })}</div>}
-        <p className="scope-disclaimer">This preflight does not execute unit, integration, or browser test code. Full source test execution needs a separately isolated runner; the repository stays unchanged.</p>
+        <p className="scope-disclaimer">The preflight remains read-only. Approved AI-generated Python unit tests run in an isolated Docker sandbox; arbitrary project dependency installation, JavaScript, integration, and browser tests are not enabled.</p>
       </div> : <div className="workspace">
         <div className="grid">
           {[

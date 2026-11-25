@@ -51,9 +51,23 @@ services:
       AI_PROVIDER: ${AI_PROVIDER:-openai}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      RUNNER_URL: http://python-runner:8080
+    networks: [default, runner_internal]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+      python-runner: {condition: service_healthy}
+
+  python-runner:
+    build: ./workers/runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [runner_internal]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   frontend:
     build:
@@ -79,3 +93,7 @@ services:
 volumes:
   postgres_data:
   grafana_data:
+
+networks:
+  runner_internal:
+    internal: true
